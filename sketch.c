@@ -9,6 +9,26 @@
 #include <stdio.h>
 #include "pico/multicore.h"
 #include <pico/stdlib.h>
+#include <Servo.h>
+
+#define CORE1_READY  0x42
+
+// Device's friendly name along with its icon.
+// All icons have names corresponing to them.
+// Refer to https://fonts.google.com/icons?icon.category=Household for eligible names.
+// Example names:
+// - bathroom
+// - sauna
+// - kitchen
+// - hallway
+// - bedroom_child / baby / parent
+// - smoking_rooms
+// - laundry
+// - warehouse
+// - garage
+// - gate
+// - coronavirus
+const char* FRIENDLY_NAME = "checkroom";
 
 // WiFi credentials 
 const char* SSID = "SSID";
@@ -17,11 +37,17 @@ const char* PASSWORD = "PASS";
 // MQTT credentials
 const char* MQTT_SERVER = "CLUSTER_ID.s1.eu.hivemq.cloud";
 const int MQTT_PORT = 8883;
-const char* MQTT_USERNAME = "CLUSTER_PASS";
-const char* MQTT_PASSWORD = "CLUSTER_LOGIN";
+const char* MQTT_USERNAME = "CLUSTER_LOGIN";
+const char* MQTT_PASSWORD = "CLUSTER_PASS";
 
 WiFiClientSecure client;
 PubSubClient mqtt_client(client);
+
+// Servo pinout
+Servo servo_doors;
+const int SERVO_PINOUT = 2;
+int g_servo_pos = 0;
+int g_servo_destination = 0;
 
 static const char *encrypt_cert PROGMEM = R"EOF(
 -----BEGIN CERTIFICATE-----
@@ -102,7 +128,7 @@ const char* mqtt_error_literal(int code) {
 
 bool instantenous = false;
 void instant_impl() { instantenous = true; };
-// Global logger with colors
+// Global logger
 void logger_impl(const char* text, LogLevels level, bool ln) {
   const char* color_code;
   switch(level) {
@@ -164,6 +190,10 @@ const char* timer_delta_impl() {
   return buffer;
 }
 
+// The id of this board
+// 12 chars + null terminator
+char g_device_id[13];
+
 String rssi_to_bars(int32_t rssi) {
   if (-80 >= rssi) {
     // Poor signal
@@ -181,7 +211,6 @@ void connect_to_wifi(const char* SSID, const char* PASS) {
   g_timer.start(); // Start the timer (time elapsed)
   
   WiFi.mode(WIFI_STA); // Station mode
-  WiFi.setHostname(g_device_id);
 
   int retries = 0;
   const int MAX_RETRIES = 3;
@@ -215,7 +244,7 @@ void connect_to_wifi(const char* SSID, const char* PASS) {
     delay(1500);
 
     watchdog_enable(1, 1); // Triggers a reset
-    while (true); // Wait for watchdog to ,,kick in''
+    while (true); // Wait for watchdog
   }
 
   g_log.print(" Success!", SUCCESS);
@@ -230,6 +259,8 @@ void connect_to_wifi(const char* SSID, const char* PASS) {
   g_log.next_instant();
   g_log.println(rssi_to_bars(WiFi.RSSI()).c_str(), SUCCESS);
 }
+
+struct tm timeinfo;
 
 void set_clock() {
   g_timer.start(); // Start the timer
@@ -250,16 +281,11 @@ void set_clock() {
   g_log.print(g_timer.delta(), DEBUG);
   g_log.println(")", DEBUG);
 
-  struct tm timeinfo;
   localtime_r(&now, &timeinfo);
 
   g_log.print("Current time: ", INFO);
   g_log.println(asctime(&timeinfo), DEFAULT);
 }
-
-// The id of this board
-// 12 chars + null terminator
-char g_device_id[13];
 
 void mqtt_reconnect() {
   // Loop until we're reconnected
@@ -293,14 +319,53 @@ void mqtt_reconnect() {
 
 void mqtt_callback(char* topic, byte* payload, unsigned int length) {
   if (length == 0 ) return;
+  
+  String command = "";
+  for (unsigned int i = 0; i < length; i++) {
+    command += (char)payload[i];
+  }
+
+  char buffer[64];
   if (String(topic) == "BROADCAST") {
     // requesting for the id of all listening devices
-    char buffer[32];
     snprintf(buffer, sizeof(buffer), "%s%s", "@", g_device_id);
     if (payload[0] == '?') mqtt_client.publish("BROADCAST", buffer);
   } else {
+    if (payload[0] == '@') return;
     // direct commands
-    g_log.println("Unrecognized command received", DEBUG);
+    if (command == "LIGHT_ON") {
+      // Turn lights on
+      snprintf(buffer, sizeof(buffer), "%s%s", "@L", "OK");
+
+
+    } else if (command == "LIGHT_OFF") {
+      // Turn lights off
+      snprintf(buffer, sizeof(buffer), "%s%s", "@L", "OK");
+
+
+    } else if (command == "OPEN_DOOR") {
+      // Open doors
+      snprintf(buffer, sizeof(buffer), "%s%s", "@D", "OK");
+
+
+    } else if (command == "CLOSE_DOOR") {
+      // Close doors
+      snprintf(buffer, sizeof(buffer), "%s%s", "@D", "OK");
+
+    } else if (command == "NAME") {
+      // User-friendly name
+      snprintf(buffer, sizeof(buffer), "%s%s", "@N", FRIENDLY_NAME);
+
+    } else if (command == "TIME") {
+      // Setup time
+      snprintf(buffer, sizeof(buffer), "%s%s", "@T", asctime(&timeinfo));
+      
+    } else {
+      // Unrecognized command
+      snprintf(buffer, sizeof(buffer), "%s%s", "@", "BAD_REQ");
+      
+    }
+    mqtt_client.publish(g_device_id, buffer);
   }
 }
 
@@ -374,7 +439,12 @@ void setup() {
   delay(2500); // Needed to capture serial data with the 'SimpleSerial' terminal
                // SimpleSerial allows for ANSI escape codes in contrast to Arduino's IDE built-in terminal, which does not.
   g_log.next_instant(); // Prints the next line instantenously
-  g_log.println("[START INIT]\n", WARNING);
+  g_log.println("[START]\n", WARNING);
+
+  servo_doors.attach(SERVO_PINOUT);
+
+  //*** Connecting to WiFi. ***//
+  connect_to_wifi(SSID, PASSWORD);
   
   //*** Creating unique-ish ID address of the Arduino ***//
   SHA256 sha256;
@@ -394,9 +464,6 @@ void setup() {
     sprintf(&g_device_id[i*2], "%02x", hash[i]);
   }
   g_device_id[12] = '\0'; // Null terminator
-
-  //*** Connecting to WiFi. ***//
-  connect_to_wifi(SSID, PASSWORD);
 
   // Additional spacing.
   g_log.println("", DEBUG);
@@ -418,11 +485,27 @@ void setup() {
   mqtt_reconnect();
   // As it is possible for the Arduino to lose connection, all configs are inside the reconnect() function.
 
+  char buffer2[32];
+  snprintf(buffer2, sizeof(buffer2), "%s%s", "@", g_device_id);
+  mqtt_client.publish("BROADCAST", buffer2);
+  // Send the id once, maybe someone's already listening in on the broadcast channel.
+
   g_log.next_instant();
-  g_log.println("[END INIT]", ERROR);
+  g_log.println("[END]", ERROR);
 }
 
+unsigned long last_move = 0;
+const int move_interval = 20; // ms between steps
+
 void loop() {
+  if (g_servo_pos != g_servo_destination && millis() - last_move >= move_interval) {
+    last_move = millis();
+
+    int direction = (g_servo_destination > g_servo_pos) ? 1 : -1;
+    g_servo_pos += direction;
+    servo_doors.write(g_servo_pos);
+  }
+
   if (!mqtt_client.connected()) {
     mqtt_reconnect();
   }
